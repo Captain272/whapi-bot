@@ -2,7 +2,8 @@ import os
 import re
 import logging
 import time
-from datetime import datetime
+from datetime import datetime,timezone, timedelta
+
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException
@@ -10,16 +11,18 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder
+from threading import Timer
 
 # Load environment variables once
 load_dotenv()
 ALLOWED_DUTY_MANAGER_NUMBER = os.getenv('ALLOWED_DUTY_MANAGER_NUMBER')
-MAX_DELAY = int(os.getenv('MAX_DELAY', '10'))
+ALLOWED_HOTEL_EMPLOYEE_NUMBER = os.getenv("ALLOWED_HOTEL_EMPLOYEE_NUMBER")
+MAX_DELAY = int(os.getenv('MAX_DELAY', '3'))
 BOT_URL = os.getenv('BOT_URL')
 API_URL = os.getenv('API_URL')
 TOKEN = os.getenv('TOKEN')
 BOT_NUMBER = os.getenv('bot')
-ALLOWED_HOTEL_EMPLOYEE_NUMBER = 919100196360
+ROOMS = os.getenv("ROOMS")
 
 # Precompile regex
 ROOM_PATTERN = re.compile(
@@ -27,9 +30,42 @@ ROOM_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-logging.basicConfig(level=logging.WARNING)
+# Logging setup
+# logging.basicConfig(filename="bot_logs.log", level=logging.INFO,
+#                     format="%(asctime)s - %(levelname)s - %(message)s")
 
 responded_messages = set()
+session = requests.Session()
+
+
+def update_env_var(key: str, value: str):
+    """Update environment variable dynamically."""
+    with open(".env", "r") as file:
+        lines = file.readlines()
+    updated = False
+    with open(".env", "w") as file:
+        for line in lines:
+            if line.startswith(f"{key}="):
+                file.write(f"{key}={value}\n")
+                updated = True
+            else:
+                file.write(line)
+        if not updated:
+            file.write(f"{key}={value}\n")
+    os.environ[key] = value
+
+
+def periodic_wake_call():
+    """Send periodic wake-up calls to keep the bot awake."""
+    try:
+        response = session.get(BOT_URL)
+        # logging.info(f"Periodic call response: {response.status_code}")
+    except Exception as e:
+        # logging.error(f"Error in periodic wake call: {e}")
+        pass
+    Timer(6, periodic_wake_call).start()
+
+
 alert_messages = []
 bot_active = bool(BOT_NUMBER)
 
@@ -85,11 +121,18 @@ def set_hook():
         }
         send_whapi_request('settings', settings, 'PATCH')
 
+
+
+@app.on_event("startup")
+def startup_event():
+    set_hook()
+    periodic_wake_call()
+
 @app.post("/hook/messages/messages")
 def handle_new_messages(request_data: Dict[str, Any]):
     start_time = time.perf_counter()  # Record start time
 
-    global bot_active, ALLOWED_HOTEL_EMPLOYEE_NUMBER, ALLOWED_DUTY_MANAGER_NUMBER
+    global bot_active, ALLOWED_HOTEL_EMPLOYEE_NUMBER, ALLOWED_DUTY_MANAGER_NUMBER,ROOMS
 
     if not request_data:
         raise HTTPException(status_code=400, detail="No JSON payload")
@@ -125,17 +168,19 @@ def handle_new_messages(request_data: Dict[str, Any]):
         if chat_name == "SIT - SIA Flight Delay Group Chat" and bot_active and sender == ALLOWED_DUTY_MANAGER_NUMBER:
             if "hi all" in text_body:
                 rooms = extract_rooms(text_body)
-                if rooms and rooms[0]['count'] < 50:
+                if rooms and rooms[0]['count'] < int(ROOMS):
                     response_body = "RPS can"
                     alert_messages.append(text_body)
 
             if "rps" in text_body and "we will take" in text_body and alert_messages:
+                SST = timezone(timedelta(hours=8))
+
                 stamp = message.get("timestamp")
-                readable_time = datetime.fromtimestamp(stamp)
+                readable_time = datetime.fromtimestamp(stamp, SST).strftime('%Y-%m-%d %H:%M:%S')
                 last_alert = alert_messages[-1]
                 full_resp = (
                     f"We won a bid @{ALLOWED_HOTEL_EMPLOYEE_NUMBER}\n"
-                    f"Alert received on {readable_time}\n{last_alert}\nConfirmation: {text_body}"
+                    f"Alert received on {readable_time} (SST)\n{last_alert}\nConfirmation: {text_body}"
                 )
 
                 send_whapi_request("messages/text", {'to': str(ALLOWED_HOTEL_EMPLOYEE_NUMBER), 'body': full_resp})
@@ -147,36 +192,49 @@ def handle_new_messages(request_data: Dict[str, Any]):
 
         # Handle Internal Group Commands
         elif chat_name == "SIT - SIA Internal Group":
-            if text_body == "@916303689715 start":
+            if text_body == "@919100196360 start":
                 bot_active = True
                 response_body = "Application started successfully."
-            elif text_body == "@916303689715 shutdown":
+            elif text_body == "@919100196360 shutdown":
                 bot_active = False
                 response_body = "Application shut down successfully."
-            elif text_body == "@916303689715 hotel employee number":
+            elif text_body == "@919100196360 hotel number":
                 response_body = f"The current hotel employee number is {ALLOWED_HOTEL_EMPLOYEE_NUMBER}."
-            elif text_body.startswith("@916303689715 change hotel employee number"):
-                new_num = text_body.replace("@916303689715 change hotel employee number", "").strip()
+            elif text_body.startswith("@919100196360 change hotel number"):
+                new_num = text_body.replace("@919100196360 change hotel number", "").strip()
                 if new_num:
                     ALLOWED_HOTEL_EMPLOYEE_NUMBER = new_num
                     response_body = f"Hotel employee number updated to {new_num}."
-            elif text_body == "@916303689715 airlines number":
+                    update_env_var("ALLOWED_HOTEL_EMPLOYEE_NUMBER", new_num)
+            elif text_body == "@919100196360 airlines number":
                 response_body = f"The current airlines number is {ALLOWED_DUTY_MANAGER_NUMBER}."
-            elif text_body.startswith("@916303689715 change airlines number"):
-                new_num = text_body.replace("@916303689715 change airlines number", "").strip()
+            elif text_body.startswith("@919100196360 change airlines number"):
+                new_num = text_body.replace("@919100196360 change airlines number", "").strip()
                 if new_num:
                     ALLOWED_DUTY_MANAGER_NUMBER = new_num
                     response_body = f"Airlines number updated to {new_num}."
-            elif "@916303689715 help" in text_body:
+                    update_env_var("ALLOWED_DUTY_MANAGER_NUMBER", new_num)
+
+            elif text_body == "@919100196360 view rooms":
+                response_body = f"Available rooms: {ROOMS}"
+
+            elif text_body.startswith("@919100196360 change rooms"):
+                new_rooms = text_body.replace("@919100196360 change rooms", "").strip()
+                ROOMS = new_rooms
+                update_env_var("ROOMS", new_rooms)
+                response_body = f"Rooms updated to: {new_rooms}"
+            elif "@919100196360 help" in text_body:
                 response_body = (
-                    "You can try following messages to command the bot:\n"
+                    "You can try following messages to command the application:\n"
                     "1. To start the application, type: start\n"
-                    "2. To shut down the application, type: shutdown\n"
-                    "3. To view hotel employee number, type: hotel employee number\n"
-                    "4. To change hotel employee number, type: change hotel employee number <number>\n"
-                    "5. To view what is the airlines number, type: airlines number\n"
-                    "6. To change airlines number, type: change airlines number <65xxxxxxxx>\n"
-                    "7. To view commands, type: help"
+                    "2. To shut down the application, type: stop\n"
+                    "3. To view what is the airlines number, type: airlines number\n"
+                    "4. To change airlines number, type:change airlines number <65xxxxxxxx>\n"
+                    "5. To view hotel employee number, type: hotel number\n"
+                    "6. To change hotel employee number, type: change hotel number <65xxxxxxxx>\n"
+                    "7. To view available rooms, type: view rooms\n"
+                    "8. To change available rooms, type: change rooms <details>\n"
+                    "9. To view commands, type: help"
                 )
 
         # Send a response if any was constructed
@@ -209,4 +267,3 @@ def index():
 @app.on_event("startup")
 def startup_event():
     set_hook()
-
