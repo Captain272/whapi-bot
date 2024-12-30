@@ -283,6 +283,7 @@ from dotenv import load_dotenv
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from threading import Timer
+import watchtower
 
 # Load environment variables once
 load_dotenv()
@@ -295,11 +296,18 @@ TOKEN = os.getenv('TOKEN')
 BOT_NUMBER = os.getenv('bot')
 ROOMS = os.getenv("ROOMS")
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# Set up CloudWatch logging
+logger = logging.getLogger("FastAPIBot")  # Use a custom logger name for clarity
+logger.setLevel(logging.INFO)
+
+# Add CloudWatch Log Handler
+cloudwatch_handler = watchtower.CloudWatchLogHandler(log_group="FastAPIBotLogs", stream_name="FastAPIBotStream")
+logger.addHandler(cloudwatch_handler)
+
+# Remove any default console handlers
+for handler in logger.handlers:
+    if isinstance(handler, logging.StreamHandler):
+        logger.removeHandler(handler)
 
 responded_messages = set()
 session = requests.Session()
@@ -324,9 +332,9 @@ def periodic_wake_call():
     """Send periodic wake-up calls to keep the bot awake."""
     try:
         response = session.get(BOT_URL)
-        logging.info(f"Periodic wake call response: {response.status_code}")
+        logger.info(f"Periodic wake call response: {response.status_code}")
     except Exception as e:
-        logging.error(f"Error in periodic wake call: {e}")
+        logger.error(f"Error in periodic wake call: {e}")
     Timer(60, periodic_wake_call).start()
 
 alert_messages = []
@@ -338,16 +346,43 @@ ROOM_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-def extract_rooms(message: str):
-    matches = ROOM_PATTERN.findall(message)
-    result = []
+# def extract_rooms(message: str):
+#     matches = ROOM_PATTERN.findall(message)
+#     result = []
+#     for m in matches:
+#         if m[0] and m[1]:  # e.g. "7 ROOMS (ECONOMY)"
+#             result.append({'count': int(m[0]), 'type': m[1].upper()})
+#         elif m[2]:  # e.g. "2 rms for economy"
+#             rt = m[4].upper() if m[4] else "UNKNOWN"
+#             result.append({'count': int(m[2]), 'type': rt})
+#     return result
+
+
+def extract_rooms(text):
+    matches = ROOM_PATTERN.findall(text)
+    
+    all_rooms = []
     for m in matches:
-        if m[0] and m[1]:  # e.g. "7 ROOMS (ECONOMY)"
-            result.append({'count': int(m[0]), 'type': m[1].upper()})
-        elif m[2]:  # e.g. "2 rms for economy"
-            rt = m[4].upper() if m[4] else "UNKNOWN"
-            result.append({'count': int(m[2]), 'type': rt})
-    return result
+        # m is a tuple of groups: (countA, typeA, countB, typeB)
+        # We'll interpret them:
+        if m[0] and m[1]:
+            # Matched the pattern: "<count> rooms (ECONOMY|BUSINESS)"
+            room_count = int(m[0])
+            room_type = m[1].lower()
+        else:
+            # Matched the pattern: "<count> rooms for (economy|business)"
+            room_count = int(m[2])
+            # m[3] is something like "for business" or "for economy"
+            # if you only want "business"/"economy", you might parse further:
+            room_type = m[3].replace('for ', '').lower().strip()
+
+        all_rooms.append({
+            'count': room_count,
+            'type': room_type
+        })
+
+    return all_rooms
+
 
 app = FastAPI(title="Airline Alert Bot")
 
@@ -355,17 +390,17 @@ def send_whapi_request(endpoint: str, params: Dict[str, Any] = None, method: str
     url = f"{API_URL}/{endpoint}"
     headers = {'Authorization': f"Bearer {TOKEN}"}
     try:
-        logging.info(f"Sending request to {url} with params: {params}")
+        logger.info(f"Sending request to {url} with params: {params}")
         if method == 'GET':
             resp = session.get(url, params=params, headers=headers)
         else:
             headers['Content-Type'] = 'application/json'
             resp = session.request(method, url, json=params, headers=headers)
         response_data = resp.json()
-        logging.info(f"Response from {url}: {response_data}")
+        logger.info(f"Response from {url}: {response_data}")
         return response_data
     except Exception as e:
-        logging.error(f"Error in send_whapi_request: {e}")
+        logger.error(f"Error in send_whapi_request: {e}")
         return {'error': str(e)}
 
 def set_hook():
@@ -388,16 +423,16 @@ def set_hook():
 
 @app.post("/hook/messages/messages")
 def handle_new_messages(request_data: Dict[str, Any]):
-    logging.info(f"Webhook received data: {request_data}")
+    logger.info(f"Webhook received data: {request_data}")
     global bot_active, ALLOWED_HOTEL_EMPLOYEE_NUMBER, ALLOWED_DUTY_MANAGER_NUMBER, ROOMS
 
     if not request_data:
-        logging.error("No JSON payload in request")
+        logger.error("No JSON payload in request")
         raise HTTPException(status_code=400, detail="No JSON payload")
 
     messages = request_data.get('messages', [])
     if not messages:
-        logging.warning("No messages found in webhook data")
+        logger.warning("No messages found in webhook data")
         raise HTTPException(status_code=400, detail="No messages found")
 
     current_ts = int(time.time())
@@ -413,19 +448,22 @@ def handle_new_messages(request_data: Dict[str, Any]):
         timestamp = message.get("timestamp", 0)
 
         if (current_ts - timestamp) > MAX_DELAY:
-            logging.warning(f"Message {message_id} skipped due to delay")
+            logger.warning(f"Message {message_id} skipped due to delay")
             continue
 
-        logging.info(f"Processing message: {text_body} from chat: {chat_name}")
+        logger.info(f"Processing message: {text_body} from chat: {chat_name,sender,ALLOWED_DUTY_MANAGER_NUMBER,ALLOWED_HOTEL_EMPLOYEE_NUMBER}")
 
         response_body = None
 
         # Handle Flight Delay Group
         if chat_name == "SIA Delay Flight Alpha Group" and bot_active and sender == ALLOWED_DUTY_MANAGER_NUMBER:
-            if "hi all" in text_body:
-                # Add detailed logging
+            logger.info(f"Got Alert: {text_body}")
+
+            if "sq" in text_body:
+                # Add detailed logger
                 rooms = extract_rooms(text_body)
-                logging.info(f"Extracted rooms: {rooms}")
+                logger.info(f"Extracted rooms: {rooms , rooms[0]['count'] ,int(ROOMS)}")
+                # logger.info(f"Extracted rooms: {rooms}")
                 if rooms and rooms[0]['count'] < int(ROOMS):
                     response_body = "RPS can"
                     alert_messages.append(text_body)
@@ -514,7 +552,7 @@ def index():
 
 @app.get("/")
 def index():
-    logging.info("Health check: Bot is running")
+    logger.info("Health check: Bot is running")
     return "Bot is running"
 
 @app.on_event("startup")
